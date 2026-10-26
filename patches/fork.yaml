@@ -1,0 +1,89 @@
+%YAML 1.2
+---
+schema: 1
+downstream:
+  remote: origin
+  branch: downstream
+  recovery_tag_prefix: forkctl/recovery
+  publish: append
+upstream:
+  remote: upstream
+  url: https://github.com/crossterm-rs/crossterm.git
+  fetch_ref: refs/heads/master
+base:
+  target:
+    kind: tag
+    selector: refs/tags/0.29
+    commit: 36d95b26a26e64b0f8c12edfe11f410a6d56a812
+  canonical: 36d95b26a26e64b0f8c12edfe11f410a6d56a812
+  stack: 36d95b26a26e64b0f8c12edfe11f410a6d56a812
+documents:
+  ledger: PATCHES.md
+  exports: patches/downstream
+bookkeeping_patch: fork-tooling
+patches:
+  - name: lone-escape-wait
+    kind: source
+    purpose: >-
+      Wait a set time for the rest of a key or mouse code after a lone trailing ESC
+      before reporting the Esc key, so a read that splits right after the ESC of a mouse
+      report gives no Esc, for a-tui.
+    upstream_status: not-submitted
+    drop_when: "Upstream crossterm waits for the rest of a sequence after a lone ESC (crossterm-rs/crossterm#993, #854)."
+    scope:
+      - src/event.rs
+      - src/event/source/unix/tty.rs
+      - src/event/source/unix/mio.rs
+      - src/event/source/unix.rs
+  - name: read-waker
+    kind: source
+    purpose: "Let a thread blocked in event::read be woken: a public ReadWaker, taken before the read starts, makes the read return ErrorKind::Interrupted, so a-tui can stop its input thread and hand the terminal to an editor without losing a key."
+    upstream_status: not-submitted
+    drop_when: Upstream crossterm exposes a way to wake a blocked synchronous read.
+    scope:
+      - src/**
+  - name: lone-escape-blocking-read
+    kind: source
+    purpose: "Read a lone ESC as Esc once the escape wait passes on a blocking terminal: leave the read loop while an ESC is parked instead of reading again, which on stdin or /dev/tty waits for the next key, for a-tui."
+    upstream_status: not-submitted
+    drop_when: "The lone-escape-wait patch is dropped, or upstream crossterm waits for the rest of a sequence after a lone ESC (crossterm-rs/crossterm#993, #854)."
+    scope:
+      - src/event/source/unix/tty.rs
+  - name: fork-tooling
+    kind: tooling
+    purpose: Own fork policy, generated evidence, and integration configuration.
+    upstream_status: "inappropriate: downstream-only fork maintenance"
+    drop_when: The downstream fork is retired.
+    scope:
+      - patches/fork.yaml
+      - PATCHES.md
+      - patches/downstream/**
+      - mise.toml
+disabled_patches: []
+history:
+  - kind: patch_enabled
+    record:
+      patch:
+        name: read-waker
+        kind: source
+        purpose: "Let a thread blocked in event::read be woken: a public ReadWaker, taken before the read starts, makes the read return ErrorKind::Interrupted, so a-tui can stop its input thread and hand the terminal to an editor without losing a key."
+        upstream_status: not-submitted
+        drop_when: Upstream crossterm exposes a way to wake a blocked synchronous read.
+        scope:
+          - src/**
+      commit: b42cb063e4f377caab38ca2e534e250103776dde
+      position: 1
+      reason: Waits on the editor-gate trial; victor-software-house/crossterm#1 proposes it
+      recovery:
+        tag: forkctl/recovery/1793813498258474000-5bcda261001a
+        tag_object: 66b56506b6059c5770f66052cb47cf3e11a13d45
+        old_base: 36d95b26a26e64b0f8c12edfe11f410a6d56a812
+        old_tip: 5bcda261001a237ab6a8db80caa55fdd4525afc8
+    recovery:
+      tag: forkctl/recovery/1793816113077749000-fcb9d18eefe6
+      tag_object: 70d16bfdf0ad20c5b737883dfeda1581beda567a
+      old_base: 36d95b26a26e64b0f8c12edfe11f410a6d56a812
+      old_tip: fcb9d18eefe685bd17abe46a4e73577fb25b012c
+contracts:
+  allow_base: []
+  required_text: []

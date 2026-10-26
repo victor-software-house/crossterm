@@ -1,0 +1,440 @@
+[PATCH] read-waker
+
+From: =?UTF-8?q?Victor=20Ara=C3=BAjo?= <victor@victor-software-house.com>
+
+Downstream-Reason: Let a thread blocked in event::read be woken: a public ReadWaker, taken before the read starts, makes the read return ErrorKind::Interrupted, so a-tui can stop its input thread and hand the terminal to an editor without losing a key.
+Upstream-Status: not-submitted
+Drop-When: Upstream crossterm exposes a way to wake a blocked synchronous read.
+---
+ src/event.rs                  |   23 +++++++++++++++++++++
+ src/event/read.rs             |   45 ++++++++++++++++++++++++++++++++++++++---
+ src/event/source.rs           |    4 ++--
+ src/event/source/unix/mio.rs  |   14 ++++++-------
+ src/event/source/unix/tty.rs  |   18 ++++++++--------
+ src/event/source/windows.rs   |    8 ++++---
+ src/event/sys.rs              |    4 ++--
+ src/event/sys/unix.rs         |    2 +-
+ src/event/sys/windows.rs      |    2 +-
+ src/event/sys/windows/poll.rs |   18 ++++++++--------
+ 10 files changed, 100 insertions(+), 38 deletions(-)
+
+diff --git a/src/event.rs b/src/event.rs
+index 5197017..56d4498 100644
+--- a/src/event.rs
++++ b/src/event.rs
+@@ -255,6 +255,29 @@ pub fn read() -> std::io::Result<Event> {
+     }
+ }
+ 
++/// Wakes a thread blocked in [`read`]: the read returns an error of kind
++/// [`ErrorKind::Interrupted`](std::io::ErrorKind::Interrupted) and stops
++/// reading the terminal's input, so another process, such as an editor, can
++/// read it. A wake while no read waits makes the next [`read`] return that
++/// error at once.
++///
++/// Take it with [`read_waker`] before a thread blocks in [`read`], which holds
++/// the reader for as long as it waits.
++#[derive(Clone, Debug)]
++pub struct ReadWaker(sys::Waker);
++
++impl ReadWaker {
++    /// Wakes the thread blocked in [`read`], if any.
++    pub fn wake(&self) -> std::io::Result<()> {
++        self.0.wake()
++    }
++}
++
++/// The [`ReadWaker`] for [`read`], to take before a thread blocks in it.
++pub fn read_waker() -> std::io::Result<ReadWaker> {
++    lock_internal_event_reader().try_waker().map(ReadWaker)
++}
++
+ /// How long a lone ESC that ends a read waits for the rest of its sequence, in
+ /// microseconds, at most `u32::MAX` (about 71 minutes); see [`set_escape_wait`].
+ static ESCAPE_WAIT_US: AtomicU32 = AtomicU32::new(0);
+diff --git a/src/event/read.rs b/src/event/read.rs
+index 22f989b..8fa70b6 100644
+--- a/src/event/read.rs
++++ b/src/event/read.rs
+@@ -4,7 +4,7 @@ use std::{collections::vec_deque::VecDeque, io, time::Duration};
+ use crate::event::source::unix::UnixInternalEventSource;
+ #[cfg(windows)]
+ use crate::event::source::windows::WindowsEventSource;
+-#[cfg(feature = "event-stream")]
++#[cfg(feature = "events")]
+ use crate::event::sys::Waker;
+ use crate::event::{filter::Filter, source::EventSource, timeout::PollTimeout, InternalEvent};
+ 
+@@ -39,6 +39,16 @@ impl InternalEventReader {
+         self.source.as_ref().expect("reader source not set").waker()
+     }
+ 
++    /// Returns a `Waker` for the source, or the error a missing source gives.
++    pub(crate) fn try_waker(&self) -> io::Result<Waker> {
++        self.source
++            .as_ref()
++            .map(|source| source.waker())
++            .ok_or_else(|| {
++                io::Error::new(io::ErrorKind::Other, "Failed to initialize input reader")
++            })
++    }
++
+     pub(crate) fn poll<F>(&mut self, timeout: Option<Duration>, filter: &F) -> io::Result<bool>
+     where
+         F: Filter,
+@@ -120,7 +130,13 @@ impl InternalEventReader {
+                 }
+             }
+ 
+-            let _ = self.poll(None, filter)?;
++            // A poll with no timeout returns `false` only when a `Waker` woke it.
++            if !self.poll(None, filter)? {
++                return Err(io::Error::new(
++                    io::ErrorKind::Interrupted,
++                    "the read was woken by `ReadWaker::wake`",
++                ));
++            }
+         }
+     }
+ }
+@@ -383,6 +399,29 @@ mod tests {
+         assert_eq!(reader.read(&InternalEventFilter).unwrap(), EVENT);
+     }
+ 
++    #[test]
++    fn test_read_returns_interrupted_when_woken_and_reads_on_after() {
++        const EVENT: InternalEvent = InternalEvent::Event(Event::Resize(10, 10));
++
++        // A woken source answers `Interrupted`, as the tty and mio sources do.
++        let source = FakeSource {
++            events: vec![EVENT].into(),
++            error: Some(io::Error::new(io::ErrorKind::Interrupted, "woken")),
++        };
++
++        let mut reader = InternalEventReader {
++            events: VecDeque::new(),
++            source: Some(Box::new(source)),
++            skipped_events: Vec::with_capacity(32),
++        };
++
++        assert_eq!(
++            reader.read(&InternalEventFilter).map_err(|e| e.kind()),
++            Err(io::ErrorKind::Interrupted)
++        );
++        assert_eq!(reader.read(&InternalEventFilter).unwrap(), EVENT);
++    }
++
+     #[derive(Default)]
+     struct FakeSource {
+         events: VecDeque<InternalEvent>,
+@@ -428,7 +467,7 @@ mod tests {
+             Ok(None)
+         }
+ 
+-        #[cfg(feature = "event-stream")]
++        #[cfg(feature = "events")]
+         fn waker(&self) -> super::super::sys::Waker {
+             unimplemented!();
+         }
+diff --git a/src/event/source.rs b/src/event/source.rs
+index e53bd31..9f5f03b 100644
+--- a/src/event/source.rs
++++ b/src/event/source.rs
+@@ -1,6 +1,6 @@
+ use std::{io, time::Duration};
+ 
+-#[cfg(feature = "event-stream")]
++#[cfg(feature = "events")]
+ use super::sys::Waker;
+ use super::InternalEvent;
+ 
+@@ -22,6 +22,6 @@ pub(crate) trait EventSource: Sync + Send {
+     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>>;
+ 
+     /// Returns a `Waker` allowing to wake/force the `try_read` method to return `Ok(None)`.
+-    #[cfg(feature = "event-stream")]
++    #[cfg(feature = "events")]
+     fn waker(&self) -> Waker;
+ }
+diff --git a/src/event/source/unix/mio.rs b/src/event/source/unix/mio.rs
+index 41720b5..2235410 100644
+--- a/src/event/source/unix/mio.rs
++++ b/src/event/source/unix/mio.rs
+@@ -7,7 +7,7 @@ use std::{
+ use mio::{unix::SourceFd, Events, Interest, Poll, Token};
+ use signal_hook_mio::v1_0::Signals;
+ 
+-#[cfg(feature = "event-stream")]
++#[cfg(feature = "events")]
+ use crate::event::sys::Waker;
+ use crate::event::{
+     escape_wait, source::EventSource, sys::unix::parse::parse_event, timeout::PollTimeout, Event,
+@@ -18,7 +18,7 @@ use crate::terminal::sys::file_descriptor::{tty_fd, FileDesc};
+ // Tokens to identify file descriptor
+ const TTY_TOKEN: Token = Token(0);
+ const SIGNAL_TOKEN: Token = Token(1);
+-#[cfg(feature = "event-stream")]
++#[cfg(feature = "events")]
+ const WAKE_TOKEN: Token = Token(2);
+ 
+ // I (@zrzka) wasn't able to read more than 1_022 bytes when testing
+@@ -33,7 +33,7 @@ pub(crate) struct UnixInternalEventSource {
+     tty_buffer: [u8; TTY_BUFFER_SIZE],
+     tty_fd: FileDesc<'static>,
+     signals: Signals,
+-    #[cfg(feature = "event-stream")]
++    #[cfg(feature = "events")]
+     waker: Waker,
+ }
+ 
+@@ -53,7 +53,7 @@ impl UnixInternalEventSource {
+         let mut signals = Signals::new([signal_hook::consts::SIGWINCH])?;
+         registry.register(&mut signals, SIGNAL_TOKEN, Interest::READABLE)?;
+ 
+-        #[cfg(feature = "event-stream")]
++        #[cfg(feature = "events")]
+         let waker = Waker::new(registry, WAKE_TOKEN)?;
+ 
+         Ok(UnixInternalEventSource {
+@@ -63,7 +63,7 @@ impl UnixInternalEventSource {
+             tty_buffer: [0u8; TTY_BUFFER_SIZE],
+             tty_fd: input_fd,
+             signals,
+-            #[cfg(feature = "event-stream")]
++            #[cfg(feature = "events")]
+             waker,
+         })
+     }
+@@ -157,7 +157,7 @@ impl EventSource for UnixInternalEventSource {
+                             ))));
+                         }
+                     }
+-                    #[cfg(feature = "event-stream")]
++                    #[cfg(feature = "events")]
+                     WAKE_TOKEN => {
+                         return Err(std::io::Error::new(
+                             std::io::ErrorKind::Interrupted,
+@@ -175,7 +175,7 @@ impl EventSource for UnixInternalEventSource {
+         }
+     }
+ 
+-    #[cfg(feature = "event-stream")]
++    #[cfg(feature = "events")]
+     fn waker(&self) -> Waker {
+         self.waker.clone()
+     }
+diff --git a/src/event/source/unix/tty.rs b/src/event/source/unix/tty.rs
+index 72540d7..4c128fe 100644
+--- a/src/event/source/unix/tty.rs
++++ b/src/event/source/unix/tty.rs
+@@ -16,7 +16,7 @@ use crate::event::timeout::PollTimeout;
+ use crate::event::Event;
+ use filedescriptor::{poll, pollfd, POLLIN};
+ 
+-#[cfg(feature = "event-stream")]
++#[cfg(feature = "events")]
+ use crate::event::sys::Waker;
+ use crate::event::{
+     escape_wait, source::EventSource, sys::unix::parse::parse_event, InternalEvent, KeyCode,
+@@ -24,13 +24,13 @@ use crate::event::{
+ use crate::terminal::sys::file_descriptor::{tty_fd, FileDesc};
+ 
+ /// Holds a prototypical Waker and a receiver we can wait on when doing select().
+-#[cfg(feature = "event-stream")]
++#[cfg(feature = "events")]
+ struct WakePipe {
+     receiver: UnixStream,
+     waker: Waker,
+ }
+ 
+-#[cfg(feature = "event-stream")]
++#[cfg(feature = "events")]
+ impl WakePipe {
+     fn new() -> io::Result<Self> {
+         let (receiver, sender) = nonblocking_unix_pair()?;
+@@ -51,7 +51,7 @@ pub(crate) struct UnixInternalEventSource {
+     tty_buffer: [u8; TTY_BUFFER_SIZE],
+     tty: FileDesc<'static>,
+     winch_signal_receiver: UnixStream,
+-    #[cfg(feature = "event-stream")]
++    #[cfg(feature = "events")]
+     wake_pipe: WakePipe,
+ }
+ 
+@@ -81,7 +81,7 @@ impl UnixInternalEventSource {
+                 pipe::register(rustix::process::Signal::WINCH.as_raw(), sender)?;
+                 receiver
+             },
+-            #[cfg(feature = "event-stream")]
++            #[cfg(feature = "events")]
+             wake_pipe: WakePipe::new()?,
+         })
+     }
+@@ -118,13 +118,13 @@ impl EventSource for UnixInternalEventSource {
+             }
+         }
+ 
+-        #[cfg(not(feature = "event-stream"))]
++        #[cfg(not(feature = "events"))]
+         let mut fds = [
+             make_pollfd(&self.tty),
+             make_pollfd(&self.winch_signal_receiver),
+         ];
+ 
+-        #[cfg(feature = "event-stream")]
++        #[cfg(feature = "events")]
+         let mut fds = [
+             make_pollfd(&self.tty),
+             make_pollfd(&self.winch_signal_receiver),
+@@ -204,7 +204,7 @@ impl EventSource for UnixInternalEventSource {
+                 ))));
+             }
+ 
+-            #[cfg(feature = "event-stream")]
++            #[cfg(feature = "events")]
+             if fds[2].revents & POLLIN != 0 {
+                 #[cfg(feature = "libc")]
+                 let fd = FileDesc::new(self.wake_pipe.receiver.as_raw_fd(), false);
+@@ -222,7 +222,7 @@ impl EventSource for UnixInternalEventSource {
+         Ok(None)
+     }
+ 
+-    #[cfg(feature = "event-stream")]
++    #[cfg(feature = "events")]
+     fn waker(&self) -> Waker {
+         self.wake_pipe.waker.clone()
+     }
+diff --git a/src/event/source/windows.rs b/src/event/source/windows.rs
+index fa40cc5..29f891c 100644
+--- a/src/event/source/windows.rs
++++ b/src/event/source/windows.rs
+@@ -7,7 +7,7 @@ use crate::event::{
+     Event,
+ };
+ 
+-#[cfg(feature = "event-stream")]
++#[cfg(feature = "events")]
+ use crate::event::sys::Waker;
+ use crate::event::{
+     source::EventSource,
+@@ -29,9 +29,9 @@ impl WindowsEventSource {
+         Ok(WindowsEventSource {
+             console,
+ 
+-            #[cfg(not(feature = "event-stream"))]
++            #[cfg(not(feature = "events"))]
+             poll: WinApiPoll::new(),
+-            #[cfg(feature = "event-stream")]
++            #[cfg(feature = "events")]
+             poll: WinApiPoll::new()?,
+ 
+             surrogate_buffer: None,
+@@ -93,7 +93,7 @@ impl EventSource for WindowsEventSource {
+         }
+     }
+ 
+-    #[cfg(feature = "event-stream")]
++    #[cfg(feature = "events")]
+     fn waker(&self) -> Waker {
+         self.poll.waker()
+     }
+diff --git a/src/event/sys.rs b/src/event/sys.rs
+index bd79307..2a37994 100644
+--- a/src/event/sys.rs
++++ b/src/event/sys.rs
+@@ -1,6 +1,6 @@
+-#[cfg(all(unix, feature = "event-stream"))]
++#[cfg(all(unix, feature = "events"))]
+ pub(crate) use unix::waker::Waker;
+-#[cfg(all(windows, feature = "event-stream"))]
++#[cfg(all(windows, feature = "events"))]
+ pub(crate) use windows::waker::Waker;
+ 
+ #[cfg(unix)]
+diff --git a/src/event/sys/unix.rs b/src/event/sys/unix.rs
+index 2106ca0..d5c1fe2 100644
+--- a/src/event/sys/unix.rs
++++ b/src/event/sys/unix.rs
+@@ -1,4 +1,4 @@
+-#[cfg(feature = "event-stream")]
++#[cfg(feature = "events")]
+ pub(crate) mod waker;
+ 
+ #[cfg(feature = "events")]
+diff --git a/src/event/sys/windows.rs b/src/event/sys/windows.rs
+index d405ae8..c7047a4 100644
+--- a/src/event/sys/windows.rs
++++ b/src/event/sys/windows.rs
+@@ -8,7 +8,7 @@ use crossterm_winapi::{ConsoleMode, Handle};
+ 
+ pub(crate) mod parse;
+ pub(crate) mod poll;
+-#[cfg(feature = "event-stream")]
++#[cfg(feature = "events")]
+ pub(crate) mod waker;
+ 
+ const ENABLE_MOUSE_MODE: u32 = 0x0010 | 0x0080 | 0x0008;
+diff --git a/src/event/sys/windows/poll.rs b/src/event/sys/windows/poll.rs
+index 84d9bf7..bf1f061 100644
+--- a/src/event/sys/windows/poll.rs
++++ b/src/event/sys/windows/poll.rs
+@@ -10,22 +10,22 @@ use winapi::{
+     },
+ };
+ 
+-#[cfg(feature = "event-stream")]
++#[cfg(feature = "events")]
+ pub(crate) use super::waker::Waker;
+ 
+ #[derive(Debug)]
+ pub(crate) struct WinApiPoll {
+-    #[cfg(feature = "event-stream")]
++    #[cfg(feature = "events")]
+     waker: Waker,
+ }
+ 
+ impl WinApiPoll {
+-    #[cfg(not(feature = "event-stream"))]
++    #[cfg(not(feature = "events"))]
+     pub(crate) fn new() -> WinApiPoll {
+         WinApiPoll {}
+     }
+ 
+-    #[cfg(feature = "event-stream")]
++    #[cfg(feature = "events")]
+     pub(crate) fn new() -> std::io::Result<WinApiPoll> {
+         Ok(WinApiPoll {
+             waker: Waker::new()?,
+@@ -43,11 +43,11 @@ impl WinApiPoll {
+ 
+         let console_handle = Handle::current_in_handle()?;
+ 
+-        #[cfg(feature = "event-stream")]
++        #[cfg(feature = "events")]
+         let semaphore = self.waker.semaphore();
+-        #[cfg(feature = "event-stream")]
++        #[cfg(feature = "events")]
+         let handles = &[*console_handle, **semaphore.handle()];
+-        #[cfg(not(feature = "event-stream"))]
++        #[cfg(not(feature = "events"))]
+         let handles = &[*console_handle];
+ 
+         let output =
+@@ -58,7 +58,7 @@ impl WinApiPoll {
+                 // input handle triggered
+                 Ok(Some(true))
+             }
+-            #[cfg(feature = "event-stream")]
++            #[cfg(feature = "events")]
+             output if output == WAIT_OBJECT_0 + 1 => {
+                 // semaphore handle triggered
+                 let _ = self.waker.reset();
+@@ -79,7 +79,7 @@ impl WinApiPoll {
+         }
+     }
+ 
+-    #[cfg(feature = "event-stream")]
++    #[cfg(feature = "events")]
+     pub fn waker(&self) -> Waker {
+         self.waker.clone()
+     }
