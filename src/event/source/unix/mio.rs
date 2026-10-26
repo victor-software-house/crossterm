@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, io, time::Duration};
+use std::{
+    collections::VecDeque,
+    io,
+    time::{Duration, Instant},
+};
 
 use mio::{unix::SourceFd, Events, Interest, Poll, Token};
 use signal_hook_mio::v1_0::Signals;
@@ -6,7 +10,8 @@ use signal_hook_mio::v1_0::Signals;
 #[cfg(feature = "event-stream")]
 use crate::event::sys::Waker;
 use crate::event::{
-    source::EventSource, sys::unix::parse::parse_event, timeout::PollTimeout, Event, InternalEvent,
+    escape_wait, source::EventSource, sys::unix::parse::parse_event, timeout::PollTimeout, Event,
+    InternalEvent, KeyCode,
 };
 use crate::terminal::sys::file_descriptor::{tty_fd, FileDesc};
 
@@ -70,10 +75,20 @@ impl EventSource for UnixInternalEventSource {
             return Ok(Some(event));
         }
 
+        let wait = escape_wait();
+        // a lone ESC parked by an earlier call whose wait has passed
+        if self.parser.flush_escape(wait, Instant::now()) {
+            return Ok(self.parser.next());
+        }
+
         let timeout = PollTimeout::new(timeout);
 
         loop {
-            if let Err(e) = self.poll.poll(&mut self.events, timeout.leftover()) {
+            let left = sooner(
+                timeout.leftover(),
+                self.parser.escape_left(wait, Instant::now()),
+            );
+            if let Err(e) = self.poll.poll(&mut self.events, left) {
                 // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
                 // Previous versions of Mio (< 0.7) would automatically retry the poll call if it was interrupted (if EINTR was returned).
                 // https://docs.rs/mio/0.7.0/mio/struct.Poll.html#notes
@@ -85,8 +100,14 @@ impl EventSource for UnixInternalEventSource {
             };
 
             if self.events.is_empty() {
-                // No readiness events = timeout
-                return Ok(None);
+                // No readiness events = timeout, of the caller or of a parked ESC
+                if self.parser.flush_escape(wait, Instant::now()) {
+                    return Ok(self.parser.next());
+                }
+                if self.parser.parked.is_none() || timeout.elapsed() {
+                    return Ok(None);
+                }
+                continue;
             }
 
             for token in self.events.iter().map(|x| x.token()) {
@@ -99,6 +120,8 @@ impl EventSource for UnixInternalEventSource {
                                         self.parser.advance(
                                             &self.tty_buffer[..read_count],
                                             read_count == TTY_BUFFER_SIZE,
+                                            wait,
+                                            Instant::now(),
                                         );
                                     }
                                 }
@@ -168,6 +191,9 @@ impl EventSource for UnixInternalEventSource {
 struct Parser {
     buffer: Vec<u8>,
     internal_events: VecDeque<InternalEvent>,
+    // When the buffer holds a lone ESC that ended a read and waits, for the
+    // `escape_wait` in force, for the rest of its sequence.
+    parked: Option<Instant>,
 }
 
 impl Default for Parser {
@@ -190,18 +216,32 @@ impl Default for Parser {
             // method implementation, all events are consumed before the next TTY_BUFFER
             // is processed -> events pushed.
             internal_events: VecDeque::with_capacity(128),
+            parked: None,
         }
     }
 }
 
 impl Parser {
-    fn advance(&mut self, buffer: &[u8], more: bool) {
+    // With a nonzero `wait`, a lone ESC that ends `buffer` with no more input
+    // pending is held, from `now`, for the rest of its sequence instead of
+    // being read as Esc.
+    fn advance(&mut self, buffer: &[u8], more: bool, wait: Duration, now: Instant) {
+        // a parked ESC followed by another ESC was the Esc key
+        if self.parked.take().is_some() && buffer.first() == Some(&b'\x1B') {
+            self.buffer.clear();
+            self.push_escape();
+        }
         for (idx, byte) in buffer.iter().enumerate() {
             let more = idx + 1 < buffer.len() || more;
 
             self.buffer.push(*byte);
 
-            match parse_event(&self.buffer, more) {
+            let park = !more && !wait.is_zero() && self.buffer == *b"\x1B";
+            if park {
+                self.parked = Some(now);
+            }
+
+            match parse_event(&self.buffer, more || park) {
                 Ok(Some(ie)) => {
                     self.internal_events.push_back(ie);
                     self.buffer.clear();
@@ -218,6 +258,38 @@ impl Parser {
             }
         }
     }
+
+    // How long a parked ESC still waits at `now`, or None when none is parked.
+    fn escape_left(&self, wait: Duration, now: Instant) -> Option<Duration> {
+        self.parked
+            .map(|at| (at + wait).saturating_duration_since(now))
+    }
+
+    // Reads a parked ESC as Esc once its wait has passed at `now`, and says
+    // whether it did.
+    fn flush_escape(&mut self, wait: Duration, now: Instant) -> bool {
+        if self.escape_left(wait, now) != Some(Duration::ZERO) {
+            return false;
+        }
+        self.parked = None;
+        self.buffer.clear();
+        self.push_escape();
+        true
+    }
+
+    fn push_escape(&mut self) {
+        self.internal_events
+            .push_back(InternalEvent::Event(Event::Key(KeyCode::Esc.into())));
+    }
+}
+
+// The sooner of two poll timeouts, None being no timeout.
+fn sooner(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, None) => a,
+        (None, b) => b,
+    }
 }
 
 impl Iterator for Parser {
@@ -225,5 +297,53 @@ impl Iterator for Parser {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.internal_events.pop_front()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io::Write, os::unix::net::UnixStream, time::Duration};
+
+    use super::UnixInternalEventSource;
+    use crate::event::{
+        set_escape_wait, source::EventSource, Event, InternalEvent, KeyCode, KeyModifiers,
+        MouseEvent, MouseEventKind,
+    };
+    use crate::terminal::sys::file_descriptor::FileDesc;
+
+    // The one test that sets the process-wide wait: no other test reads it.
+    // The parser's cases are tested in the `tty` source, which shares its code.
+    #[test]
+    fn try_read_waits_for_the_rest_of_a_split_report() {
+        let (input, mut terminal) = UnixStream::pair().unwrap();
+        input.set_nonblocking(true).unwrap();
+        #[cfg(feature = "libc")]
+        let fd = FileDesc::new(std::os::unix::io::IntoRawFd::into_raw_fd(input), true);
+        #[cfg(not(feature = "libc"))]
+        let fd = FileDesc::Owned(input.into());
+        let mut source = UnixInternalEventSource::from_file_descriptor(fd).unwrap();
+        let esc = InternalEvent::Event(Event::Key(KeyCode::Esc.into()));
+        let wheel_up = InternalEvent::Event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 9,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        }));
+
+        // longer than any stall, so the split is never read as Esc
+        set_escape_wait(Duration::from_secs(60));
+        terminal.write_all(b"\x1b").unwrap();
+        assert_eq!(
+            source.try_read(Some(Duration::from_millis(10))).unwrap(),
+            None
+        );
+        terminal.write_all(b"[<64;10;5M").unwrap();
+        assert_eq!(source.try_read(None).unwrap(), Some(wheel_up));
+
+        // with nothing after it, the ESC is Esc once the wait passes
+        set_escape_wait(Duration::from_millis(20));
+        terminal.write_all(b"\x1b").unwrap();
+        assert_eq!(source.try_read(None).unwrap(), Some(esc));
+        set_escape_wait(Duration::ZERO);
     }
 }

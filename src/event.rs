@@ -139,6 +139,7 @@ use crate::event::{
 use crate::{csi, Command};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use std::fmt::{self, Display};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use bitflags::bitflags;
@@ -252,6 +253,33 @@ pub fn read() -> std::io::Result<Event> {
         #[cfg(unix)]
         _ => unreachable!(),
     }
+}
+
+/// How long a lone ESC that ends a read waits for the rest of its sequence, in
+/// microseconds, at most `u32::MAX` (about 71 minutes); see [`set_escape_wait`].
+static ESCAPE_WAIT_US: AtomicU32 = AtomicU32::new(0);
+
+/// Sets how long a lone ESC at the end of a read waits for more input before it
+/// is read as [`KeyCode::Esc`].
+///
+/// A terminal sends a mouse report or a key such as an arrow as one sequence
+/// that starts with ESC, and a read can end right after that ESC when the rest
+/// has not arrived yet: a fast mouse wheel makes this common. With no wait, the
+/// ESC is read as the Esc key and the rest as typed characters, such as
+/// `[<64;10;5M`. With a wait, a lone ESC is held until more input arrives, and
+/// is read as Esc only if none does in time, as ncurses' `ESCDELAY` does.
+///
+/// The default is zero: a lone ESC is read as Esc at once. Unix only; it has no
+/// effect on Windows, whose console reports keys as records.
+pub fn set_escape_wait(wait: Duration) {
+    let us = u32::try_from(wait.as_micros()).unwrap_or(u32::MAX);
+    ESCAPE_WAIT_US.store(us, Ordering::Relaxed);
+}
+
+/// The wait [`set_escape_wait`] last set.
+#[cfg(unix)]
+pub(crate) fn escape_wait() -> Duration {
+    Duration::from_micros(u64::from(ESCAPE_WAIT_US.load(Ordering::Relaxed)))
 }
 
 /// Polls to check if there are any `InternalEvent`s that can be read within the given duration.
