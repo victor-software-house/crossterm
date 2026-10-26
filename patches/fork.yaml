@@ -1,0 +1,52 @@
+%YAML 1.2
+---
+schema: 1
+downstream:
+  remote: origin
+  branch: downstream
+  recovery_tag_prefix: forkctl/recovery
+  publish: append
+upstream:
+  remote: upstream
+  url: https://github.com/crossterm-rs/crossterm.git
+  fetch_ref: refs/heads/master
+base:
+  target:
+    kind: tag
+    selector: refs/tags/0.29
+    commit: 36d95b26a26e64b0f8c12edfe11f410a6d56a812
+  canonical: 36d95b26a26e64b0f8c12edfe11f410a6d56a812
+  stack: 36d95b26a26e64b0f8c12edfe11f410a6d56a812
+documents:
+  ledger: PATCHES.md
+  exports: patches/downstream
+bookkeeping_patch: fork-tooling
+patches:
+  - name: lone-escape-wait
+    kind: source
+    purpose: >-
+      Wait a set time for the rest of a key or mouse code after a lone trailing ESC
+      before reporting the Esc key, so a read that splits right after the ESC of a mouse
+      report gives no Esc, for a-tui.
+    upstream_status: not-submitted
+    drop_when: "Upstream crossterm waits for the rest of a sequence after a lone ESC (crossterm-rs/crossterm#993, #854)."
+    scope:
+      - src/event.rs
+      - src/event/source/unix/tty.rs
+      - src/event/source/unix/mio.rs
+      - src/event/source/unix.rs
+  - name: fork-tooling
+    kind: tooling
+    purpose: Own fork policy, generated evidence, and integration configuration.
+    upstream_status: "inappropriate: downstream-only fork maintenance"
+    drop_when: The downstream fork is retired.
+    scope:
+      - patches/fork.yaml
+      - PATCHES.md
+      - patches/downstream/**
+      - mise.toml
+disabled_patches: []
+history: []
+contracts:
+  allow_base: []
+  required_text: []
