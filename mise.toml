@@ -1,0 +1,13 @@
+min_version = "2026.10.9"
+
+[settings]
+experimental = true
+lockfile = true
+
+[env]
+FORKCTL_MANIFEST = "patches/fork.yaml"
+
+[task_config]
+includes = [
+  "git::https://github.com/victor-software-house/forkctl.git//tasks/fork?ref=v0.0.42",
+]
