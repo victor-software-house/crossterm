@@ -10,7 +10,7 @@ Drop-When: The lone-escape-wait patch is dropped, or upstream crossterm waits fo
  1 file changed, 44 insertions(+), 1 deletion(-)
 
 diff --git a/src/event/source/unix/tty.rs b/src/event/source/unix/tty.rs
-index 72540d7..ce46e74 100644
+index 4c128fe..ef5bafb 100644
 --- a/src/event/source/unix/tty.rs
 +++ b/src/event/source/unix/tty.rs
 @@ -177,7 +177,11 @@ impl EventSource for UnixInternalEventSource {
