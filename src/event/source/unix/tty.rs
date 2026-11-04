@@ -177,7 +177,11 @@ impl EventSource for UnixInternalEventSource {
                         return Ok(Some(event));
                     }
 
-                    if read_count == 0 {
+                    // A parked ESC waits for the rest of its code in `poll`,
+                    // which times out after the escape wait: reading again
+                    // here would wait for the next key on a blocking
+                    // terminal, as stdin and /dev/tty are.
+                    if read_count == 0 || self.parser.parked.is_some() {
                         break;
                     }
                 }
@@ -472,6 +476,45 @@ mod tests {
         set_escape_wait(Duration::from_millis(20));
         terminal.write_all(b"\x1b").unwrap();
         assert_eq!(source.try_read(None).unwrap(), Some(esc()));
+
+        // A terminal reads as a blocking descriptor, as stdin and /dev/tty do: a
+        // lone ESC that ends a read is still Esc once the wait passes, and an
+        // arrow's code that follows within the wait is still the arrow. The read
+        // runs on a thread, so a read that waits for the next key fails the test
+        // instead of hanging it.
+        let (input, mut terminal) = UnixStream::pair().unwrap();
+        #[cfg(feature = "libc")]
+        let fd = FileDesc::new(std::os::unix::io::IntoRawFd::into_raw_fd(input), true);
+        #[cfg(not(feature = "libc"))]
+        let fd = FileDesc::Owned(input.into());
+        let mut source = UnixInternalEventSource::from_file_descriptor(fd).unwrap();
+        let (asked, ask) = std::sync::mpsc::channel::<()>();
+        let (read_tx, read) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while ask.recv().is_ok() {
+                let event = source.try_read(None).map_err(|e| e.kind());
+                if read_tx.send(event).is_err() {
+                    return;
+                }
+            }
+        });
+        terminal.write_all(b"\x1b").unwrap();
+        asked.send(()).unwrap();
+        assert_eq!(
+            read.recv_timeout(Duration::from_secs(5)),
+            Ok(Ok(Some(esc()))),
+            "a lone ESC on a blocking terminal waited for the next key"
+        );
+        set_escape_wait(Duration::from_secs(60));
+        terminal.write_all(b"\x1b").unwrap();
+        asked.send(()).unwrap();
+        terminal.write_all(b"[A").unwrap();
+        assert_eq!(
+            read.recv_timeout(Duration::from_secs(5)),
+            Ok(Ok(Some(InternalEvent::Event(Event::Key(
+                KeyCode::Up.into()
+            )))))
+        );
         set_escape_wait(Duration::ZERO);
     }
 }
