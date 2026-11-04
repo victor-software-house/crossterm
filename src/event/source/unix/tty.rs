@@ -16,7 +16,7 @@ use crate::event::timeout::PollTimeout;
 use crate::event::Event;
 use filedescriptor::{poll, pollfd, POLLIN};
 
-#[cfg(feature = "event-stream")]
+#[cfg(feature = "events")]
 use crate::event::sys::Waker;
 use crate::event::{
     escape_wait, source::EventSource, sys::unix::parse::parse_event, InternalEvent, KeyCode,
@@ -24,13 +24,13 @@ use crate::event::{
 use crate::terminal::sys::file_descriptor::{tty_fd, FileDesc};
 
 /// Holds a prototypical Waker and a receiver we can wait on when doing select().
-#[cfg(feature = "event-stream")]
+#[cfg(feature = "events")]
 struct WakePipe {
     receiver: UnixStream,
     waker: Waker,
 }
 
-#[cfg(feature = "event-stream")]
+#[cfg(feature = "events")]
 impl WakePipe {
     fn new() -> io::Result<Self> {
         let (receiver, sender) = nonblocking_unix_pair()?;
@@ -51,7 +51,7 @@ pub(crate) struct UnixInternalEventSource {
     tty_buffer: [u8; TTY_BUFFER_SIZE],
     tty: FileDesc<'static>,
     winch_signal_receiver: UnixStream,
-    #[cfg(feature = "event-stream")]
+    #[cfg(feature = "events")]
     wake_pipe: WakePipe,
 }
 
@@ -81,7 +81,7 @@ impl UnixInternalEventSource {
                 pipe::register(rustix::process::Signal::WINCH.as_raw(), sender)?;
                 receiver
             },
-            #[cfg(feature = "event-stream")]
+            #[cfg(feature = "events")]
             wake_pipe: WakePipe::new()?,
         })
     }
@@ -118,13 +118,13 @@ impl EventSource for UnixInternalEventSource {
             }
         }
 
-        #[cfg(not(feature = "event-stream"))]
+        #[cfg(not(feature = "events"))]
         let mut fds = [
             make_pollfd(&self.tty),
             make_pollfd(&self.winch_signal_receiver),
         ];
 
-        #[cfg(feature = "event-stream")]
+        #[cfg(feature = "events")]
         let mut fds = [
             make_pollfd(&self.tty),
             make_pollfd(&self.winch_signal_receiver),
@@ -204,7 +204,7 @@ impl EventSource for UnixInternalEventSource {
                 ))));
             }
 
-            #[cfg(feature = "event-stream")]
+            #[cfg(feature = "events")]
             if fds[2].revents & POLLIN != 0 {
                 #[cfg(feature = "libc")]
                 let fd = FileDesc::new(self.wake_pipe.receiver.as_raw_fd(), false);
@@ -222,7 +222,7 @@ impl EventSource for UnixInternalEventSource {
         Ok(None)
     }
 
-    #[cfg(feature = "event-stream")]
+    #[cfg(feature = "events")]
     fn waker(&self) -> Waker {
         self.wake_pipe.waker.clone()
     }

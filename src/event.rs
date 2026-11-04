@@ -255,6 +255,29 @@ pub fn read() -> std::io::Result<Event> {
     }
 }
 
+/// Wakes a thread blocked in [`read`]: the read returns an error of kind
+/// [`ErrorKind::Interrupted`](std::io::ErrorKind::Interrupted) and stops
+/// reading the terminal's input, so another process, such as an editor, can
+/// read it. A wake while no read waits makes the next [`read`] return that
+/// error at once.
+///
+/// Take it with [`read_waker`] before a thread blocks in [`read`], which holds
+/// the reader for as long as it waits.
+#[derive(Clone, Debug)]
+pub struct ReadWaker(sys::Waker);
+
+impl ReadWaker {
+    /// Wakes the thread blocked in [`read`], if any.
+    pub fn wake(&self) -> std::io::Result<()> {
+        self.0.wake()
+    }
+}
+
+/// The [`ReadWaker`] for [`read`], to take before a thread blocks in it.
+pub fn read_waker() -> std::io::Result<ReadWaker> {
+    lock_internal_event_reader().try_waker().map(ReadWaker)
+}
+
 /// How long a lone ESC that ends a read waits for the rest of its sequence, in
 /// microseconds, at most `u32::MAX` (about 71 minutes); see [`set_escape_wait`].
 static ESCAPE_WAIT_US: AtomicU32 = AtomicU32::new(0);
