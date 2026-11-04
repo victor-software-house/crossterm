@@ -4,7 +4,7 @@ use std::{collections::vec_deque::VecDeque, io, time::Duration};
 use crate::event::source::unix::UnixInternalEventSource;
 #[cfg(windows)]
 use crate::event::source::windows::WindowsEventSource;
-#[cfg(feature = "event-stream")]
+#[cfg(feature = "events")]
 use crate::event::sys::Waker;
 use crate::event::{filter::Filter, source::EventSource, timeout::PollTimeout, InternalEvent};
 
@@ -37,6 +37,16 @@ impl InternalEventReader {
     #[cfg(feature = "event-stream")]
     pub(crate) fn waker(&self) -> Waker {
         self.source.as_ref().expect("reader source not set").waker()
+    }
+
+    /// Returns a `Waker` for the source, or the error a missing source gives.
+    pub(crate) fn try_waker(&self) -> io::Result<Waker> {
+        self.source
+            .as_ref()
+            .map(|source| source.waker())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "Failed to initialize input reader")
+            })
     }
 
     pub(crate) fn poll<F>(&mut self, timeout: Option<Duration>, filter: &F) -> io::Result<bool>
@@ -120,7 +130,13 @@ impl InternalEventReader {
                 }
             }
 
-            let _ = self.poll(None, filter)?;
+            // A poll with no timeout returns `false` only when a `Waker` woke it.
+            if !self.poll(None, filter)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "the read was woken by `ReadWaker::wake`",
+                ));
+            }
         }
     }
 }
@@ -383,6 +399,29 @@ mod tests {
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), EVENT);
     }
 
+    #[test]
+    fn test_read_returns_interrupted_when_woken_and_reads_on_after() {
+        const EVENT: InternalEvent = InternalEvent::Event(Event::Resize(10, 10));
+
+        // A woken source answers `Interrupted`, as the tty and mio sources do.
+        let source = FakeSource {
+            events: vec![EVENT].into(),
+            error: Some(io::Error::new(io::ErrorKind::Interrupted, "woken")),
+        };
+
+        let mut reader = InternalEventReader {
+            events: VecDeque::new(),
+            source: Some(Box::new(source)),
+            skipped_events: Vec::with_capacity(32),
+        };
+
+        assert_eq!(
+            reader.read(&InternalEventFilter).map_err(|e| e.kind()),
+            Err(io::ErrorKind::Interrupted)
+        );
+        assert_eq!(reader.read(&InternalEventFilter).unwrap(), EVENT);
+    }
+
     #[derive(Default)]
     struct FakeSource {
         events: VecDeque<InternalEvent>,
@@ -428,7 +467,7 @@ mod tests {
             Ok(None)
         }
 
-        #[cfg(feature = "event-stream")]
+        #[cfg(feature = "events")]
         fn waker(&self) -> super::super::sys::Waker {
             unimplemented!();
         }

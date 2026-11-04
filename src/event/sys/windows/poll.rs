@@ -10,22 +10,22 @@ use winapi::{
     },
 };
 
-#[cfg(feature = "event-stream")]
+#[cfg(feature = "events")]
 pub(crate) use super::waker::Waker;
 
 #[derive(Debug)]
 pub(crate) struct WinApiPoll {
-    #[cfg(feature = "event-stream")]
+    #[cfg(feature = "events")]
     waker: Waker,
 }
 
 impl WinApiPoll {
-    #[cfg(not(feature = "event-stream"))]
+    #[cfg(not(feature = "events"))]
     pub(crate) fn new() -> WinApiPoll {
         WinApiPoll {}
     }
 
-    #[cfg(feature = "event-stream")]
+    #[cfg(feature = "events")]
     pub(crate) fn new() -> std::io::Result<WinApiPoll> {
         Ok(WinApiPoll {
             waker: Waker::new()?,
@@ -43,11 +43,11 @@ impl WinApiPoll {
 
         let console_handle = Handle::current_in_handle()?;
 
-        #[cfg(feature = "event-stream")]
+        #[cfg(feature = "events")]
         let semaphore = self.waker.semaphore();
-        #[cfg(feature = "event-stream")]
+        #[cfg(feature = "events")]
         let handles = &[*console_handle, **semaphore.handle()];
-        #[cfg(not(feature = "event-stream"))]
+        #[cfg(not(feature = "events"))]
         let handles = &[*console_handle];
 
         let output =
@@ -58,7 +58,7 @@ impl WinApiPoll {
                 // input handle triggered
                 Ok(Some(true))
             }
-            #[cfg(feature = "event-stream")]
+            #[cfg(feature = "events")]
             output if output == WAIT_OBJECT_0 + 1 => {
                 // semaphore handle triggered
                 let _ = self.waker.reset();
@@ -79,7 +79,7 @@ impl WinApiPoll {
         }
     }
 
-    #[cfg(feature = "event-stream")]
+    #[cfg(feature = "events")]
     pub fn waker(&self) -> Waker {
         self.waker.clone()
     }

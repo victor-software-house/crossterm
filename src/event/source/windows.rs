@@ -7,7 +7,7 @@ use crate::event::{
     Event,
 };
 
-#[cfg(feature = "event-stream")]
+#[cfg(feature = "events")]
 use crate::event::sys::Waker;
 use crate::event::{
     source::EventSource,
@@ -29,9 +29,9 @@ impl WindowsEventSource {
         Ok(WindowsEventSource {
             console,
 
-            #[cfg(not(feature = "event-stream"))]
+            #[cfg(not(feature = "events"))]
             poll: WinApiPoll::new(),
-            #[cfg(feature = "event-stream")]
+            #[cfg(feature = "events")]
             poll: WinApiPoll::new()?,
 
             surrogate_buffer: None,
@@ -93,7 +93,7 @@ impl EventSource for WindowsEventSource {
         }
     }
 
-    #[cfg(feature = "event-stream")]
+    #[cfg(feature = "events")]
     fn waker(&self) -> Waker {
         self.poll.waker()
     }

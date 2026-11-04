@@ -7,7 +7,7 @@ use std::{
 use mio::{unix::SourceFd, Events, Interest, Poll, Token};
 use signal_hook_mio::v1_0::Signals;
 
-#[cfg(feature = "event-stream")]
+#[cfg(feature = "events")]
 use crate::event::sys::Waker;
 use crate::event::{
     escape_wait, source::EventSource, sys::unix::parse::parse_event, timeout::PollTimeout, Event,
@@ -18,7 +18,7 @@ use crate::terminal::sys::file_descriptor::{tty_fd, FileDesc};
 // Tokens to identify file descriptor
 const TTY_TOKEN: Token = Token(0);
 const SIGNAL_TOKEN: Token = Token(1);
-#[cfg(feature = "event-stream")]
+#[cfg(feature = "events")]
 const WAKE_TOKEN: Token = Token(2);
 
 // I (@zrzka) wasn't able to read more than 1_022 bytes when testing
@@ -33,7 +33,7 @@ pub(crate) struct UnixInternalEventSource {
     tty_buffer: [u8; TTY_BUFFER_SIZE],
     tty_fd: FileDesc<'static>,
     signals: Signals,
-    #[cfg(feature = "event-stream")]
+    #[cfg(feature = "events")]
     waker: Waker,
 }
 
@@ -53,7 +53,7 @@ impl UnixInternalEventSource {
         let mut signals = Signals::new([signal_hook::consts::SIGWINCH])?;
         registry.register(&mut signals, SIGNAL_TOKEN, Interest::READABLE)?;
 
-        #[cfg(feature = "event-stream")]
+        #[cfg(feature = "events")]
         let waker = Waker::new(registry, WAKE_TOKEN)?;
 
         Ok(UnixInternalEventSource {
@@ -63,7 +63,7 @@ impl UnixInternalEventSource {
             tty_buffer: [0u8; TTY_BUFFER_SIZE],
             tty_fd: input_fd,
             signals,
-            #[cfg(feature = "event-stream")]
+            #[cfg(feature = "events")]
             waker,
         })
     }
@@ -157,7 +157,7 @@ impl EventSource for UnixInternalEventSource {
                             ))));
                         }
                     }
-                    #[cfg(feature = "event-stream")]
+                    #[cfg(feature = "events")]
                     WAKE_TOKEN => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::Interrupted,
@@ -175,7 +175,7 @@ impl EventSource for UnixInternalEventSource {
         }
     }
 
-    #[cfg(feature = "event-stream")]
+    #[cfg(feature = "events")]
     fn waker(&self) -> Waker {
         self.waker.clone()
     }
